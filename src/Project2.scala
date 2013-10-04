@@ -1,7 +1,10 @@
-import scala.actors._
-import scala.actors.Actor._
 import scala.math.abs
 import scala.util.Random
+import akka.actor.Actor
+import scala.sys.Prop
+import akka.actor.Props
+import akka.actor.ActorRef
+import scala.collection.immutable.Nil
 
 sealed trait Message
 case object Looping extends Message
@@ -11,52 +14,73 @@ case object Remove extends Message // when a neighbor exits, it must be removed 
 case class Sum(s: Double) extends Message
 case class PartialSum(val s: Double, val w: Double) extends Message
 
-abstract class Node extends Actor {
+abstract class WorkerActor extends Actor {
   var id: Int = 0
   val rand = new Random
   var count: Int = 0
-  var neighbors: Array[Node] = Array.empty
+  var neighbors:List[ActorRef] = Nil
   var boss: NetworkBuilder = null
-  def randomNeighbor: Node =
-    if (neighbors isEmpty) this // in case all neighbors exited
+  
+  def randomNeighbor: ActorRef =
+    if (neighbors isEmpty) self // in case all neighbors exited
     else neighbors(rand.nextInt(neighbors.length))
-  def init(i: Int, n: Array[Node], b: NetworkBuilder) = {
+  
+  def init(i: Int, n:List[ActorRef], b: NetworkBuilder) = {
     id = i; neighbors = n; boss = b;
+    var j = 0
+    while(j < n.length){
+      neighbors ::= context.actorOf(Props[WorkerActor])
+      j += 1
+    }
     rand.setSeed(System.currentTimeMillis() ^ (neighbors.hashCode toLong))
   }
-  override def exit() = {
+  
+  def exit() = {
     neighbors foreach(_ ! (Remove, self))
-    super.exit()
+    context.stop(self)
   }
-  def removeNeighbor(a: Node) = (neighbors = neighbors filter(_.id != a.id))
+  
+  def removeNeighbor(a: WorkerActor) = (neighbors = neighbors filter(_.id != a.id))
+  
+  def receive = {
+     case (i: Int, n: Array[WorkerActor], b: NetworkBuilder) => init(i, n, b)
+  }
 }
 
-class GossipNode extends Node {
+class GossipNode extends WorkerActor {
   private val maxCount = 10
   private def sendLoopMessage() = { self ! Looping }
   private def spreadMessage() =
-    if(count>0) randomNeighbor ! Rumor
-  def act() {
-    loopWhile(count<maxCount) {
-      sendLoopMessage()
-      spreadMessage()
-      react {
-        case (i: Int, n: Array[Node], b: NetworkBuilder) => init(i, n, b)
-        case Rumor => count += 1
-        case Looping => sendLoopMessage()
-        case Stop => exit()
-        case (Remove, a: Node) => removeNeighbor(a)
-      }
+    if(count>0) randomNeighbor ! Rumor  
+  
+  def receive = {
+      case (i: Int, n: Array[WorkerActor], b: NetworkBuilder) => init(i, n, b)
+      case Rumor => count += 1
+      case Looping => sendLoopMessage()
+      case Stop => exit()
+      case (Remove, a: WorkerActor) => removeNeighbor(a)
     }
-  }
+//  def act() {
+//    loopWhile(count<maxCount) {
+//      sendLoopMessage()
+//      spreadMessage()
+//      react {
+//        case (i: Int, n: Array[Node], b: NetworkBuilder) => init(i, n, b)
+//        case Rumor => count += 1
+//        case Looping => sendLoopMessage()
+//        case Stop => exit()
+//        case (Remove, a: Node) => removeNeighbor(a)
+//      }
+//    }
+//  }
 }
 
-class PushSumNode extends Node {
+class PushSumNode extends WorkerActor {
   private var s: Double = 0
   private var w: Double = 1
   private val nConv: Int = 5 // n convergence tests
   private val converging: Array[Boolean] = Array.fill(nConv)(false)
-  override def init(i: Int, n: Array[Node], b: NetworkBuilder) =
+  override def init(i: Int, n: Array[WorkerActor], b: NetworkBuilder) =
     { super.init(i, n, b); s = i }
   private def spreadMessage() = {
     randomNeighbor ! PartialSum(s/2.0, w/2.0)
@@ -79,12 +103,12 @@ class PushSumNode extends Node {
   }
 }
 
-abstract class NetworkBuilder(val numNodes: Int, val algorithm: () => Node) extends Actor {
+abstract class NetworkBuilder(val numNodes: Int, val algorithm: () => WorkerActor) extends Actor {
   private var count = 0
   val nodes = Array.fill(numNodes)(algorithm())
   val rand = new Random(System.currentTimeMillis())
-  def randomNode: Node = nodes(rand.nextInt(nodes.length))
-  def neighbors(x: Int): Array[Node] // implemented by different topologies
+  def randomNode: WorkerActor = nodes(rand.nextInt(nodes.length))
+  def neighbors(x: Int): Array[WorkerActor] // implemented by different topologies
   def act() {
     trapExit = true
     nodes foreach(x => {link(x); x start})
@@ -107,30 +131,30 @@ abstract class NetworkBuilder(val numNodes: Int, val algorithm: () => Node) exte
   }
 }
 
-class Full(numNodes: Int, algorithm: () => Node) extends NetworkBuilder(numNodes, algorithm) {
-  def neighbors(x: Int): Array[Node] =
+class Full(numNodes: Int, algorithm: () => WorkerActor) extends NetworkBuilder(numNodes, algorithm) {
+  def neighbors(x: Int): Array[WorkerActor] =
     Array.range(0, numNodes) filter (_!=x) map (nodes(_))
 }
 
-class Line(numNodes: Int, algorithm: () => Node) extends NetworkBuilder(numNodes, algorithm) {
+class Line(numNodes: Int, algorithm: () => WorkerActor) extends NetworkBuilder(numNodes, algorithm) {
   private def inRange(x: Int): Boolean = x>=0 && x<numNodes
-  def neighbors(x: Int): Array[Node] =
+  def neighbors(x: Int): Array[WorkerActor] =
     Array(x-1, x+1) filter (inRange(_)) map (nodes(_))
 }
 
-class Grid(val rows: Int, val cols: Int, algorithm: () => Node) extends NetworkBuilder(rows*cols, algorithm) {
-  private def at(r: Int, c: Int): Node = nodes(r*cols+c)
+class Grid(val rows: Int, val cols: Int, algorithm: () => WorkerActor) extends NetworkBuilder(rows*cols, algorithm) {
+  private def at(r: Int, c: Int): WorkerActor = nodes(r*cols+c)
   private def inRange(r: Int, c: Int): Boolean = r>=0 && c>=0 && r<rows && c<cols
-  private def neighbors(r: Int, c: Int): Array[Node] =
+  private def neighbors(r: Int, c: Int): Array[WorkerActor] =
     (Array(r-1,r,r+1,r), Array(c,c-1,c,c+1)).zipped.filter(inRange(_,_)).zipped.map(at(_,_))
-  def neighbors(x: Int): Array[Node] = neighbors(x/cols, x%cols)
+  def neighbors(x: Int): Array[WorkerActor] = neighbors(x/cols, x%cols)
 }
 
-class ImperfectGrid(rows: Int, cols: Int, algorithm: () => Node) extends Grid(rows, cols, algorithm) {
+class ImperfectGrid(rows: Int, cols: Int, algorithm: () => WorkerActor) extends Grid(rows, cols, algorithm) {
   private val groups = Random.shuffle(List.range(0, numNodes)).splitAt(numNodes/2)
   private val partnerMap = (groups._1 zip groups._2).toMap ++ (groups._2 zip groups._1).toMap
   private def partner(x: Int) = if (partnerMap contains x) partnerMap(x) else x
-  override def neighbors(x: Int): Array[Node] = super.neighbors(x) :+ nodes(partner(x))
+  override def neighbors(x: Int): Array[WorkerActor] = super.neighbors(x) :+ nodes(partner(x))
 }
 
 object project2 {

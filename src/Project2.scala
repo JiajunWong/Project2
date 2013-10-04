@@ -1,6 +1,3 @@
-
-
-
 import scala.actors._
 import scala.actors.Actor._
 import scala.math.abs
